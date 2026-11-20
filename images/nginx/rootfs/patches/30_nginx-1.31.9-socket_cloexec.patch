@@ -1,11 +1,11 @@
 diff --git a/auto/unix b/auto/unix
-index 10835f6c..b5b33bb3 100644
 --- a/auto/unix
 +++ b/auto/unix
-@@ -990,3 +990,27 @@ ngx_feature_test='struct addrinfo *res;
+@@ -1031,4 +1031,28 @@
+ ngx_feature_test='struct addrinfo *res;
                    if (getaddrinfo("localhost", NULL, NULL, &res) != 0) return 1;
                    freeaddrinfo(res)'
- . auto/feature
++. auto/feature
 +
 +ngx_feature="SOCK_CLOEXEC support"
 +ngx_feature_name="NGX_HAVE_SOCKET_CLOEXEC"
@@ -29,18 +29,18 @@ index 10835f6c..b5b33bb3 100644
 +ngx_feature_test="int fd;
 +                  fd = socket(AF_INET, SOCK_STREAM, 0);
 +                  fcntl(fd, F_SETFD, FD_CLOEXEC);"
-+. auto/feature
+ . auto/feature
 diff --git a/src/core/ngx_resolver.c b/src/core/ngx_resolver.c
-index cd55520c..438e0806 100644
 --- a/src/core/ngx_resolver.c
 +++ b/src/core/ngx_resolver.c
-@@ -4466,8 +4466,14 @@ ngx_tcp_connect(ngx_resolver_connection_t *rec)
+@@ -4603,9 +4603,15 @@
+     ngx_socket_t       s;
      ngx_event_t       *rev, *wev;
      ngx_connection_t  *c;
- 
++
 +#if (NGX_HAVE_SOCKET_CLOEXEC)
 +    s = ngx_socket(rec->sockaddr->sa_family, SOCK_STREAM | SOCK_CLOEXEC, 0);
-+
+ 
 +#else
      s = ngx_socket(rec->sockaddr->sa_family, SOCK_STREAM, 0);
  
@@ -49,7 +49,7 @@ index cd55520c..438e0806 100644
      ngx_log_debug1(NGX_LOG_DEBUG_EVENT, &rec->log, 0, "TCP socket %d", s);
  
      if (s == (ngx_socket_t) -1) {
-@@ -4494,6 +4500,15 @@ ngx_tcp_connect(ngx_resolver_connection_t *rec)
+@@ -4632,6 +4638,15 @@
          goto failed;
      }
  
@@ -66,13 +66,12 @@ index cd55520c..438e0806 100644
      wev = c->write;
  
 diff --git a/src/event/ngx_event.h b/src/event/ngx_event.h
-index 19fec68..8c2f01a 100644
 --- a/src/event/ngx_event.h
 +++ b/src/event/ngx_event.h
-@@ -73,6 +73,9 @@ struct ngx_event_s {
-     /* to test on worker exit */
+@@ -63,6 +63,9 @@
      unsigned         channel:1;
      unsigned         resolver:1;
+     unsigned         quic:1;
 +#if (HAVE_SOCKET_CLOEXEC_PATCH)
 +    unsigned         skip_socket_leak_check:1;
 +#endif
@@ -80,10 +79,9 @@ index 19fec68..8c2f01a 100644
      unsigned         cancelable:1;
  
 diff --git a/src/event/ngx_event_accept.c b/src/event/ngx_event_accept.c
-index 77563709..5827b9d0 100644
 --- a/src/event/ngx_event_accept.c
 +++ b/src/event/ngx_event_accept.c
-@@ -62,7 +62,9 @@ ngx_event_accept(ngx_event_t *ev)
+@@ -60,7 +60,9 @@
  
  #if (NGX_HAVE_ACCEPT4)
          if (use_accept4) {
@@ -94,28 +92,26 @@ index 77563709..5827b9d0 100644
          } else {
              s = accept(lc->fd, &sa.sockaddr, &socklen);
          }
-@@ -202,6 +204,16 @@ ngx_event_accept(ngx_event_t *ev)
-                     ngx_close_accepted_connection(c);
-                     return;
-                 }
-+
-+#if (NGX_HAVE_FD_CLOEXEC)
-+                if (ngx_cloexec(s) == -1) {
-+                    ngx_log_error(NGX_LOG_ALERT, ev->log, ngx_socket_errno,
-+                                  ngx_cloexec_n " failed");
-+                    ngx_close_accepted_connection(c);
-+                    return;
-+                }
-+#endif
-+
+@@ -189,6 +191,15 @@
              }
          }
  
++#if (NGX_HAVE_FD_CLOEXEC)
++        if (ngx_cloexec(s) == -1) {
++            ngx_log_error(NGX_LOG_ALERT, ev->log, ngx_socket_errno,
++                          ngx_cloexec_n " failed");
++            ngx_close_accepted_connection(c);
++            return;
++        }
++#endif
++
+ #if (NGX_HAVE_KEEPALIVE_TUNABLE && NGX_DARWIN)
+ 
+         /* Darwin doesn't inherit TCP_KEEPALIVE from a listening socket */
 diff --git a/src/event/ngx_event_connect.c b/src/event/ngx_event_connect.c
-index c5bb8068..cf33b1d2 100644
 --- a/src/event/ngx_event_connect.c
 +++ b/src/event/ngx_event_connect.c
-@@ -38,8 +38,15 @@ ngx_event_connect_peer(ngx_peer_connection_t *pc)
+@@ -38,8 +38,15 @@
  
      type = (pc->type ? pc->type : SOCK_STREAM);
  
@@ -131,27 +127,29 @@ index c5bb8068..cf33b1d2 100644
      ngx_log_debug2(NGX_LOG_DEBUG_EVENT, pc->log, 0, "%s socket %d",
                     (type == SOCK_STREAM) ? "stream" : "dgram", s);
  
-@@ -80,6 +87,15 @@ ngx_event_connect_peer(ngx_peer_connection_t *pc)
-         goto failed;
-     }
+@@ -100,9 +107,18 @@
+     if (ngx_nonblocking(s) == -1) {
+         ngx_log_error(NGX_LOG_ALERT, pc->log, ngx_socket_errno,
+                       ngx_nonblocking_n " failed");
++
++        goto failed;
++    }
  
 +#if (NGX_HAVE_FD_CLOEXEC)
 +    if (ngx_cloexec(s) == -1) {
 +        ngx_log_error(NGX_LOG_ALERT, pc->log, ngx_socket_errno,
 +                      ngx_cloexec_n " failed");
 +
-+        goto failed;
-+    }
+         goto failed;
+     }
 +#endif
-+
+ 
      if (pc->local) {
  
- #if (NGX_HAVE_TRANSPARENT_PROXY)
 diff --git a/src/os/unix/ngx_process_cycle.c b/src/os/unix/ngx_process_cycle.c
-index c4376a5..48e8fa8 100644
 --- a/src/os/unix/ngx_process_cycle.c
 +++ b/src/os/unix/ngx_process_cycle.c
-@@ -960,6 +1029,9 @@ ngx_worker_process_exit(ngx_cycle_t *cycle)
+@@ -996,6 +996,9 @@
          for (i = 0; i < cycle->connection_n; i++) {
              if (c[i].fd != -1
                  && c[i].read
@@ -160,12 +158,11 @@ index c4376a5..48e8fa8 100644
 +#endif
                  && !c[i].read->accept
                  && !c[i].read->channel
-                 && !c[i].read->resolver)
+                 && !c[i].read->resolver
 diff --git a/src/os/unix/ngx_socket.h b/src/os/unix/ngx_socket.h
-index fcc51533..d1eebf47 100644
 --- a/src/os/unix/ngx_socket.h
 +++ b/src/os/unix/ngx_socket.h
-@@ -38,6 +38,17 @@ int ngx_blocking(ngx_socket_t s);
+@@ -47,6 +47,17 @@
  
  #endif
  
